@@ -1,0 +1,8 @@
+input	data/synth_50MB.txt
+processes	4
+mode	alltoall
+bytes	56150163
+documents	14000
+tokens	8699198
+unique_words	273845
+unique_bigrams	4028932

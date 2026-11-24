@@ -1,0 +1,4 @@
+[mpi p=4 merge=alltoall] data/synth_50MB.txt : 53.5 MB, 14000 docs, 8699198 tokens, 273845 unique words, 4028932 unique bigrams
+  read 1.594s | compute 1.460s | comm 0.159s | merge 1.695s | output 0.384s | TOTAL 5.203s
+  load balance: tokens per rank min 2173866, max 2175907
+  top words: the(971059) of(461386) and(300691) in(219643) to(173796)

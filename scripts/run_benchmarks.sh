@@ -34,7 +34,12 @@ make -s all
   echo "ram: $(free -h | awk '/Mem:/ {print $2}')"
   echo "os: $(. /etc/os-release && echo "$PRETTY_NAME")"
   echo "compiler: $(g++ --version | head -1)"
-  echo "mpi: $($MPIRUN --version 2>&1 | head -1)"
+  mpi_version=$($MPIRUN --version 2>&1 | grep -m1 -E '[[:alpha:]]' || true)
+  if [ -z "$mpi_version" ]; then
+    echo "error: could not determine MPI version using '$MPIRUN --version'" >&2
+    exit 1
+  fi
+  echo "mpi: $mpi_version"
   echo "disk: $(df -h . | awk 'NR==2 {print $1}')"
 } > results/machine.txt
 cat results/machine.txt
