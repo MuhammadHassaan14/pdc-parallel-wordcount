@@ -1,0 +1,10 @@
+1	The quick brown fox jumps over the lazy dog. The dog sleeps!
+2	Parallel computing: MPI, OpenMP and CUDA are all "parallel" models.
+3	Don't split words... or bigrams; across process-boundaries, please.
+4	Café naïve résumé — UTF-8 words stay whole. THE the ThE.
+this line has no numeric id so its byte offset becomes the doc id
+5	
+
+6	the end of the sample file has no trailing newline
+7	the quick brown fox again and the lazy dog again
+8	last line without newline the fox
