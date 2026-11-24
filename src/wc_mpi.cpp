@@ -7,8 +7,13 @@
 //   2. Read        : MPI_File_read_at in 64 MB blocks, only inside own range
 //                    (plus the tail of the last line that crosses the boundary).
 //   3. Compute     : tokenize, count words + bigrams, build local index.
-//   4. Merge       : all ranks MPI_Gatherv their tables to rank 0, rank 0 merges.
-//   5. Output      : top-K words/bigrams and the inverted index (rank 0).
+//   4. Merge       : two strategies (select with --merge):
+//        gather    : all ranks MPI_Gatherv their tables to rank 0, rank 0 merges.
+//        alltoall  : each word is owned by rank hash(word) % P. Ranks exchange
+//                    data with MPI_Alltoallv so every owner merges only its share
+//                    in parallel, then owners send their local top-K to rank 0.
+//   5. Output      : top-K words/bigrams (rank 0) and the inverted index
+//                    (one part file per owner in alltoall mode).
 //   6. Stats       : totals with MPI_Reduce(SUM), phase timings with MPI_Reduce(MAX).
 
 #include <mpi.h>
@@ -30,11 +35,43 @@ static double wtime() { return MPI_Wtime(); }
 static int units8(size_t bytes, int rank, const char* what) {
     size_t u = bytes / 8;
     if (u > static_cast<size_t>(INT_MAX)) {
-        std::fprintf(stderr, "rank %d: %s message too large (%zu bytes). Use more processes.\n",
+        std::fprintf(stderr, "rank %d: %s message too large (%zu bytes). Use more processes or --merge alltoall.\n",
                      rank, what, bytes);
         MPI_Abort(MPI_COMM_WORLD, 2);
     }
     return static_cast<int>(u);
+}
+
+// Pack a list of (term,count) pairs (used to send local top-K lists to rank 0)
+static void pack_pairs(Packer& pk, const std::vector<CountPair>& v) {
+    pk.u64(v.size());
+    for (const auto& p : v) { pk.str(p.first); pk.u64(p.second); }
+}
+static void unpack_pairs(Unpacker& u, std::vector<CountPair>& out) {
+    uint64_t n = u.u64();
+    std::string s;
+    for (uint64_t i = 0; i < n; ++i) { u.str(s); uint64_t c = u.u64(); out.emplace_back(s, c); }
+}
+
+// Count word and bigram records in the received buffers (used to pre-size maps).
+static void count_records(const char* buf, size_t, const std::vector<int>& counts,
+                          const std::vector<int>& displs, size_t& wrec, size_t& brec) {
+    for (size_t s = 0; s < counts.size(); ++s) {
+        Unpacker u(buf + static_cast<size_t>(displs[s]) * 8, static_cast<size_t>(counts[s]) * 8);
+        uint32_t sec = SEC_WORDS;
+        while (u.has_more()) {
+            uint32_t len = u.u32();
+            if (len == 0) {
+                if (!u.has_more()) break;
+                sec = u.u32();
+                if (sec != SEC_WORDS && sec != SEC_BIGRAMS) break;
+                continue;
+            }
+            u.p += len;
+            if (sec == SEC_WORDS) { u.p += 8; uint32_t nd = u.u32(); u.p += static_cast<size_t>(nd) * 8; ++wrec; }
+            else { u.p += 8; ++brec; }
+        }
+    }
 }
 
 int main(int argc, char** argv) {
@@ -127,9 +164,9 @@ int main(int argc, char** argv) {
         t_output = wtime() - t0;
         my_unique_words = words.size();
         my_unique_bigrams = bigrams.size();
-    } else {
+    } else if (a.merge == "gather") {
         // ------------------------------------------------------------------
-        // 4. Centralized merge: MPI_Gather (sizes) + MPI_Gatherv (data)
+        // 4a. Centralized merge: MPI_Gather (sizes) + MPI_Gatherv (data)
         // ------------------------------------------------------------------
         double t0 = wtime();
         Packer pk;
@@ -154,7 +191,7 @@ int main(int argc, char** argv) {
             size_t total = 0;
             for (int i = 0; i < P; ++i) {
                 if (total > static_cast<size_t>(INT_MAX)) {
-                    std::fprintf(stderr, "gather: total data too large for rank 0\n");
+                    std::fprintf(stderr, "gather: total data too large for rank 0, use --merge alltoall\n");
                     MPI_Abort(MPI_COMM_WORLD, 2);
                 }
                 displs[i] = static_cast<int>(total);
@@ -184,6 +221,133 @@ int main(int argc, char** argv) {
             my_unique_words = words.size();
             my_unique_bigrams = bigrams.size();
         }
+    } else {
+        // ------------------------------------------------------------------
+        // 4b. Distributed merge: hash partition + MPI_Alltoallv
+        // ------------------------------------------------------------------
+        double t0 = wtime();
+        // Entries this rank owns itself are not packed and sent to itself:
+        // they are moved into the "mine" tables with C++17 node extraction
+        // (no copy, no new allocation). Only the other P-1 shares are packed.
+        std::vector<Packer> out(P);
+        WordMap my_words;
+        BigramMap my_bigrams;
+        for (int d = 0; d < P; ++d) section(out[d], SEC_WORDS);
+        for (auto it = words.begin(); it != words.end();) {
+            int owner = static_cast<int>(fnv1a(it->first) % P);
+            if (owner == rank) { my_words.insert(words.extract(it++)); continue; }
+            pack_word(out[owner], it->first, it->second);
+            ++it;
+        }
+        for (int d = 0; d < P; ++d) section(out[d], SEC_BIGRAMS);
+        for (auto it = bigrams.begin(); it != bigrams.end();) {
+            int owner = static_cast<int>(fnv1a(it->first) % P);
+            if (owner == rank) { my_bigrams.insert(bigrams.extract(it++)); continue; }
+            pack_bigram(out[owner], it->first, it->second);
+            ++it;
+        }
+        WordMap().swap(words);
+        BigramMap().swap(bigrams);
+        words.swap(my_words);
+        bigrams.swap(my_bigrams);
+
+        std::vector<int> scounts(P), sdispls(P), rcounts(P), rdispls(P);
+        size_t stotal = 0;
+        for (int d = 0; d < P; ++d) {
+            section(out[d], SEC_END);
+            out[d].pad8();
+            scounts[d] = units8(out[d].buf.size(), rank, "alltoall");
+            stotal += scounts[d];
+        }
+        if (stotal > static_cast<size_t>(INT_MAX)) {
+            std::fprintf(stderr, "rank %d: send buffer too large, use more processes\n", rank);
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        }
+        std::vector<char> sendbuf(stotal * 8);
+        size_t off = 0;
+        for (int d = 0; d < P; ++d) {
+            sdispls[d] = static_cast<int>(off);
+            std::memcpy(sendbuf.data() + off * 8, out[d].buf.data(), out[d].buf.size());
+            off += scounts[d];
+            std::vector<char>().swap(out[d].buf);
+        }
+        t_merge += wtime() - t0;
+
+        t0 = wtime();
+        MPI_Alltoall(scounts.data(), 1, MPI_INT, rcounts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+        size_t rtotal = 0;
+        for (int s = 0; s < P; ++s) {
+            if (rtotal > static_cast<size_t>(INT_MAX)) {
+                std::fprintf(stderr, "rank %d: receive buffer too large, use more processes\n", rank);
+                MPI_Abort(MPI_COMM_WORLD, 2);
+            }
+            rdispls[s] = static_cast<int>(rtotal);
+            rtotal += rcounts[s];
+        }
+        std::vector<char> recvbuf(rtotal * 8);
+        MPI_Alltoallv(sendbuf.data(), scounts.data(), sdispls.data(), MPI_UINT64_T, recvbuf.data(),
+                      rcounts.data(), rdispls.data(), MPI_UINT64_T, MPI_COMM_WORLD);
+        t_comm += wtime() - t0;
+        std::vector<char>().swap(sendbuf);
+
+        // Merge the share of words this rank owns.
+        // Pre-size the tables (upper bound: everything received is new) so the
+        // hash maps do not rehash repeatedly while merging.
+        t0 = wtime();
+        {
+            size_t wrec = 0, brec = 0;
+            count_records(recvbuf.data(), recvbuf.size(), rcounts, rdispls, wrec, brec);
+            words.reserve(words.size() + wrec);
+            if (a.opt.bigrams) bigrams.reserve(bigrams.size() + brec);
+        }
+        for (int s = 0; s < P; ++s)
+            unpack_merge(recvbuf.data() + static_cast<size_t>(rdispls[s]) * 8,
+                         static_cast<size_t>(rcounts[s]) * 8, words, bigrams);
+        std::vector<char>().swap(recvbuf);
+        // Each word lives on exactly one owner, so the global top-K is contained
+        // in the union of the owners' local top-K lists.
+        auto local_w = topk_words(words, a.opt.topk);
+        auto local_b = topk_bigrams(bigrams, a.opt.topk);
+        Packer tk;
+        pack_pairs(tk, local_w);
+        pack_pairs(tk, local_b);
+        tk.pad8();
+        t_merge += wtime() - t0;
+
+        // Owners write their own index part in parallel
+        t0 = wtime();
+        if (a.opt.index) write_index_part(part_name(a.out_dir + "/index", rank), words);
+        if (a.opt.dump_counts) write_counts_part(part_name(a.out_dir + "/counts", rank), words, bigrams);
+        t_output += wtime() - t0;
+        my_unique_words = words.size();
+        my_unique_bigrams = bigrams.size();
+
+        // Collect local top-K lists at rank 0 (small message)
+        t0 = wtime();
+        int my_units = units8(tk.buf.size(), rank, "topk");
+        std::vector<int> counts(rank == 0 ? P : 0), displs(rank == 0 ? P : 0);
+        MPI_Gather(&my_units, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+        std::vector<char> recv;
+        if (rank == 0) {
+            int total = 0;
+            for (int i = 0; i < P; ++i) { displs[i] = total; total += counts[i]; }
+            recv.resize(static_cast<size_t>(total) * 8);
+        }
+        MPI_Gatherv(tk.buf.data(), my_units, MPI_UINT64_T, recv.data(), counts.data(), displs.data(),
+                    MPI_UINT64_T, 0, MPI_COMM_WORLD);
+        t_comm += wtime() - t0;
+
+        if (rank == 0) {
+            t0 = wtime();
+            for (int i = 0; i < P; ++i) {
+                Unpacker u(recv.data() + static_cast<size_t>(displs[i]) * 8, static_cast<size_t>(counts[i]) * 8);
+                unpack_pairs(u, top_w);
+                unpack_pairs(u, top_b);
+            }
+            topk_inplace(top_w, a.opt.topk);
+            topk_inplace(top_b, a.opt.topk);
+            t_merge += wtime() - t0;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -194,7 +358,7 @@ int main(int argc, char** argv) {
     unsigned long long global_stats[5] = {0, 0, 0, 0, 0};
     MPI_Reduce(local_stats, global_stats, 5, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
-    std::string mode = (P == 1) ? "mpi" : "gather";
+    std::string mode = (P == 1) ? "mpi" : a.merge;
     if (rank == 0) {
         double t0 = wtime();
         write_topk(a.out_dir + "/top_words.tsv", top_w);
